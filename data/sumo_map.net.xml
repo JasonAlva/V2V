@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!-- Single-square SUMO network generated for simplicity.
+     Junctions: A0 (0,0), A1 (0,100), B1 (100,100), B0 (100,0)
+     Edges: A0A1 (north), A1B1 (east), B1B0 (south), B0A0 (west)
+-->
+
+<net version="1.20" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/net_file.xsd">
+
+  <location netOffset="0.00,0.00" convBoundary="0.00,0.00,100.00,100.00" origBoundary="0.00,0.00,100.00,100.00" projParameter="!"/>
+
+  <!-- Long edges forming a single square loop -->
+  <edge id="A0A1" from="A0" to="A1" priority="1">
+    <lane id="A0A1_0" index="0" speed="10.00" length="100.00" shape="0.00,0.00 0.00,100.00"/>
+  </edge>
+
+  <edge id="A1B1" from="A1" to="B1" priority="1">
+    <lane id="A1B1_0" index="0" speed="10.00" length="100.00" shape="0.00,100.00 100.00,100.00"/>
+  </edge>
+
+  <edge id="B1B0" from="B1" to="B0" priority="1">
+    <lane id="B1B0_0" index="0" speed="10.00" length="100.00" shape="100.00,100.00 100.00,0.00"/>
+  </edge>
+
+  <edge id="B0A0" from="B0" to="A0" priority="1">
+    <lane id="B0A0_0" index="0" speed="10.00" length="100.00" shape="100.00,0.00 0.00,0.00"/>
+  </edge>
+
+  <!-- Simple junctions at the corners -->
+  <junction id="A0" type="priority" x="0.00" y="0.00"/>
+  <junction id="A1" type="priority" x="0.00" y="100.00"/>
+  <junction id="B1" type="priority" x="100.00" y="100.00"/>
+  <junction id="B0" type="priority" x="100.00" y="0.00"/>
+
+</net>

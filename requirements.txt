@@ -1,0 +1,10 @@
+eclipse-sumo
+traci
+ultralytics
+scipy
+opencv-python
+numpy
+Pillow
+matplotlib
+fastapi
+uvicorn[standard]

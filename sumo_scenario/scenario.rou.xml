@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<routes>
+  <!-- Small square map with very slow speeds for V2V demo -->
+  <vType id="car" accel="0.5" decel="1.5" sigma="0.1" tau="2.0" minGap="2.0" length="4.8" width="1.9" maxSpeed="2.0" color="0,90,220"/>
+  <vType id="truck" accel="0.3" decel="1.0" sigma="0.1" tau="2.2" minGap="3.0" length="12.0" width="2.5" maxSpeed="1.5" color="80,80,80"/>
+  <vType id="coopCar" accel="0.4" decel="1.2" sigma="0.1" tau="2.0" minGap="2.0" length="4.8" width="1.9" maxSpeed="1.8" color="0,190,0"/>
+
+  <!-- Simple square loop: A1->B1->B0->A0->A1 forming a continuous circuit -->
+  <!-- Simplified for testing: single-edge route so SUMO doesn't fail on connectivity in minimal net -->
+  <route id="square_loop" edges="A0A1"/>
+
+  <!-- EGO: Main vehicle (primary observer) -->
+  <vehicle id="EGO_1" type="car" route="square_loop" depart="0.0" departLane="0" departPos="10" departSpeed="1.8"/>
+
+  <!-- COOP: Cooperative vehicle (supports EGO) -->
+  <vehicle id="COOP_2" type="coopCar" route="square_loop" depart="2.0" departLane="0" departPos="40" departSpeed="1.7"/>
+
+  <!-- TRUCK_1: Occluder vehicle -->
+  <vehicle id="TRUCK_1" type="truck" route="square_loop" depart="4.0" departLane="0" departPos="70" departSpeed="1.4"/>
+
+  <!-- TARGET_3: Hidden vehicle (often occluded) -->
+  <vehicle id="TARGET_3" type="car" route="square_loop" depart="6.0" departLane="0" departPos="100" departSpeed="1.6"/>
+
+  <!-- CROSS_4: Additional traffic -->
+  <vehicle id="CROSS_4" type="car" route="square_loop" depart="8.0" departLane="0" departPos="150" departSpeed="1.5"/>
+
+</routes>
