@@ -4,6 +4,11 @@ Exposes:
   GET /health          — liveness probe
   WS  /ws/live         — broadcast channel; clients receive one JSON message
                          per simulation step, identical in shape to latest.json
+  GET /live/*          — static serve of data/live/
+  GET /frames/*        — static serve of data/frames/
+  GET /fused/*         — static serve of data/fused/
+  GET /images/*        — static serve of data/images/
+  GET /sumo_map.net.xml — current SUMO network file
 
 Run standalone (for testing):
   uvicorn ws_server:app --host 0.0.0.0 --port 8765 --reload
@@ -17,12 +22,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import threading
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +97,47 @@ async def live_ws(ws: WebSocket) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Static data endpoints — mounted dynamically by start_background_server()
+# ---------------------------------------------------------------------------
+
+_data_root: Path | None = None
+
+
+def _mount_static_dirs(data_root: Path) -> None:
+    """Mount simulation output directories as static file routes.
+
+    Called once by start_background_server() before uvicorn starts so the
+    directories exist before the first request comes in.
+    """
+    global _data_root
+    _data_root = data_root
+
+    routes = {
+        "/live":   "live",
+        "/frames": "frames",
+        "/fused":  "fused",
+        "/images": "images",
+    }
+    for route, subdir in routes.items():
+        path = data_root / subdir
+        path.mkdir(parents=True, exist_ok=True)
+        # Use a unique name to avoid duplicate-mount errors on re-use.
+        app.mount(route, StaticFiles(directory=str(path), html=False), name=subdir)
+        logger.info("[ws] Serving %s → %s", route, path)
+
+
+@app.get("/sumo_map.net.xml")
+async def serve_sumo_map() -> FileResponse:
+    """Serve the current SUMO network file so the frontend can parse it."""
+    if _data_root is None:
+        return FileResponse(status_code=404, path=__file__)  # fallback
+    net_file = _data_root / "sumo_map.net.xml"
+    if not net_file.exists():
+        return FileResponse(status_code=404, path=__file__)
+    return FileResponse(str(net_file), media_type="application/xml")
+
+
+# ---------------------------------------------------------------------------
 # Broadcast helper (called from synchronous pipeline thread via asyncio bridge)
 # ---------------------------------------------------------------------------
 
@@ -121,12 +170,18 @@ _server_loop: asyncio.AbstractEventLoop | None = None
 _server_started = threading.Event()
 
 
-def start_background_server(host: str = "0.0.0.0", port: int = 8765) -> None:
+def start_background_server(
+    host: str = "0.0.0.0",
+    port: int = 8765,
+    data_root: Path | None = None,
+) -> None:
     """Spin up uvicorn in a daemon thread.
 
     Blocks until the server is ready (up to ~10 s) so callers can safely
     call push_frame() immediately afterwards.
     """
+    if data_root is not None:
+        _mount_static_dirs(data_root)
 
     def _run() -> None:
         global _server_loop
@@ -157,6 +212,7 @@ def start_background_server(host: str = "0.0.0.0", port: int = 8765) -> None:
     ok = _server_started.wait(timeout=10.0)
     if ok:
         print(f"[ws] WebSocket server ready -> ws://{host}:{port}/ws/live")
+        print(f"[ws] Static data server    -> http://{host}:{port}/frames|live|fused|images")
     else:
         print(f"[ws] WARNING: WebSocket server did not start within 10 s on port {port}")
 

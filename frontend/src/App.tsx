@@ -239,7 +239,6 @@ function App() {
   const [wsStatus, setWsStatus] = useState<WsStatus>("reconnecting");
   const [sumoMap, setSumoMap] = useState<SumoMap | null>(null);
   const [mapError, setMapError] = useState("");
-  const [fitMap, setFitMap] = useState(false);
 
   // Monotonically-incrementing counter used as the image cache-buster.
   // Only bumps when a payload arrives that contains a *real* bev_image URL
@@ -278,6 +277,13 @@ function App() {
         if (payload.frame_index > maxFrameRef.current) {
           maxFrameRef.current = payload.frame_index;
         }
+        console.log(
+          `[WS] frame=${payload.frame_index} t=${payload.sim_time?.toFixed(2)}s` +
+          ` vehicles=[${(payload.vehicles ?? []).join(", ")}]` +
+          ` bev=${payload.bev_image ?? "(none)"}` +
+          ` dashboards=${Object.keys(payload.dashboards ?? {}).join(", ") || "(none)"}` +
+          ` bev_by_observer=${Object.keys(payload.bev_by_observer ?? {}).join(", ") || "(none)"}`
+        );
         setLiveManifest(payload);
         setFrameIndex(payload.frame_index);
         // Only bump the image revision when a *real* BEV render has landed.
@@ -296,6 +302,11 @@ function App() {
           lastBevImageRef.current = payload.bev_image ?? "";
           imgRevisionRef.current += 1;
           setImgRevision(imgRevisionRef.current);
+          console.log(
+            `[WS] 🖼️  Real render detected — bumping image revision to ${imgRevisionRef.current}` +
+            `  bev=${payload.bev_image ?? "(none)"}` +
+            `  dashKeys=[${Object.keys(payload.dashboards ?? {}).join(", ")}]`
+          );
         }
       } catch {
         // malformed frame — ignore
@@ -382,6 +393,17 @@ function App() {
           lastBevImageRef.current = payload.bev_image ?? "";
           imgRevisionRef.current += 1;
           setImgRevision(imgRevisionRef.current);
+          console.log(
+            `[POLL] 🖼️  Real render detected — revision=${imgRevisionRef.current}` +
+            `  frame=${payload.frame_index}` +
+            `  bev=${payload.bev_image ?? "(none)"}` +
+            `  dashKeys=[${Object.keys(payload.dashboards ?? {}).join(", ")}]`
+          );
+        } else {
+          console.log(
+            `[POLL] frame=${payload.frame_index} t=${payload.sim_time?.toFixed(2)}s — no new render` +
+            ` (wsStatus=${wsStatusRef.current})`
+          );
         }
       } catch {
         // Keep the last visible frame if the live manifest is not ready yet.
@@ -454,6 +476,7 @@ function App() {
     async function loadFrame() {
       try {
         setError("");
+        console.log(`[MAP] Loading frame JSON: ${fileName}`);
         const response = await fetch(`${fileName}?ts=${Date.now()}`);
         if (!response.ok) {
           throw new Error(`Frame ${frameIndex} not found (${response.status})`);
@@ -462,6 +485,14 @@ function App() {
         const json = (await response.json()) as FrameData;
 
         if (cancelled) return;
+
+        console.log(
+          `[MAP] ✅ Frame ${json.step} loaded` +
+          `  t=${json.sim_time.toFixed(2)}s` +
+          `  vehicles=[${json.all_vehicles.map((v) => v.id).join(", ")}]` +
+          `  ego=${json.ego?.id ?? "(none)"}` +
+          `  coop=${json.coop?.id ?? "(none)"}`
+        );
 
         setFrameData(json);
         const ids = new Set(json.all_vehicles.map((vehicle) => vehicle.id));
@@ -479,6 +510,7 @@ function App() {
         });
       } catch (err) {
         if (!cancelled) {
+          console.warn(`[MAP] ❌ Failed to load frame ${frameIndex}:`, (err as Error).message);
           setError((err as Error).message);
           setFrameData(null);
         }
@@ -556,16 +588,8 @@ function App() {
         mapBounds.maxY - mapBounds.minY,
       ) / 2;
 
-  const mapViewBounds = fitMap
-    ? mapBounds
-    : observer
-      ? {
-          minX: Math.max(mapBounds.minX, focusCenterX - focusHalfSpan),
-          maxX: Math.min(mapBounds.maxX, focusCenterX + focusHalfSpan),
-          minY: Math.max(mapBounds.minY, focusCenterY - focusHalfSpan),
-          maxY: Math.min(mapBounds.maxY, focusCenterY + focusHalfSpan),
-        }
-      : mapBounds;
+  // Always show the full SUMO map bounds (zoomed-out view)
+  const mapViewBounds = mapBounds;
 
   const mapWidth = Math.max(1, mapViewBounds.maxX - mapViewBounds.minX);
   const mapHeight = Math.max(1, mapViewBounds.maxY - mapViewBounds.minY);
@@ -596,14 +620,7 @@ function App() {
             {live ? "Live ON" : "Live OFF"}
           </Button>
 
-          <Button
-            variant={fitMap ? "default" : "outline"}
-            onClick={() => setFitMap((v) => !v)}
-            className="ml-2"
-          >
-            <MapIcon className="mr-1 h-4 w-4" />
-            {fitMap ? "Fit Map: Full" : "Fit Map"}
-          </Button>
+          {/* Fit Map control removed — map now always shows full SUMO bounds */}
 
           {/* WebSocket connection status indicator */}
           {live && (
@@ -950,8 +967,7 @@ function App() {
             {frameData && (
               <p className="pt-3 text-sm text-slate-300">
                 Step {frameData.step} | t={frameData.sim_time.toFixed(2)}s |
-                Vehicles: {vehicles.length} | Map focus:{" "}
-                {fitMap ? "full" : `${MAP_FOCUS_RANGE_M}m`}
+                Vehicles: {vehicles.length} | Map focus: full
               </p>
             )}
             {mapError && (
@@ -1061,6 +1077,16 @@ function App() {
                 src={`${observerDashboard}?ts=${liveRefreshKey}`}
                 alt="Selected vehicle synthetic dashboard"
                 className="max-h-64 w-full rounded-md border border-slate-700 object-contain"
+                onLoad={() =>
+                  console.log(
+                    `[DASH] 🟢 Image loaded  frame=${frameIndex}  rev=${liveRefreshKey}  src=${observerDashboard}`
+                  )
+                }
+                onError={() =>
+                  console.warn(
+                    `[DASH] 🔴 Image error   frame=${frameIndex}  rev=${liveRefreshKey}  src=${observerDashboard}`
+                  )
+                }
               />
             ) : (
               <div className="flex h-40 items-center justify-center rounded-md border border-slate-700/50 bg-slate-950/40">
@@ -1082,6 +1108,16 @@ function App() {
               src={`${bevImage}?ts=${liveRefreshKey}`}
               alt="Realtime bird eye view"
               className="max-h-64 w-full rounded-md border border-slate-700 object-contain"
+              onLoad={() =>
+                console.log(
+                  `[BEV] 🟢 Image loaded  frame=${frameIndex}  rev=${liveRefreshKey}  src=${bevImage}`
+                )
+              }
+              onError={() =>
+                console.warn(
+                  `[BEV] 🔴 Image error   frame=${frameIndex}  rev=${liveRefreshKey}  src=${bevImage}`
+                )
+              }
             />
           </CardContent>
         </Card>

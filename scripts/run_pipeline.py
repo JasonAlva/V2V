@@ -33,7 +33,11 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--skip-detection", action="store_true", help="Skip YOLO stage")
     parser.add_argument("--skip-video", action="store_true", help="Skip MP4 export")
-    parser.add_argument("--clean", action="store_true", help="Delete prior outputs before running")
+    # Cleaning previous outputs is the default behavior. Use `--no-clean` to opt out.
+    g = parser.add_mutually_exclusive_group()
+    g.add_argument("--clean", dest="clean", action="store_true", help="Delete prior outputs before running (default)")
+    g.add_argument("--no-clean", dest="clean", action="store_false", help="Do not delete prior outputs before running")
+    parser.set_defaults(clean=True)
 
     return parser.parse_args()
 

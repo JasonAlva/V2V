@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<edges>
+    <!-- East-West road: 2 directional edges -->
+    <edge id="west_in"   from="west"   to="center" priority="2" numLanes="1" speed="3.0"/>
+    <edge id="west_out"  from="center" to="west"   priority="2" numLanes="1" speed="3.0"/>
+    <edge id="east_in"   from="east"   to="center" priority="2" numLanes="1" speed="3.0"/>
+    <edge id="east_out"  from="center" to="east"   priority="2" numLanes="1" speed="3.0"/>
+
+    <!-- North-South road: 2 directional edges -->
+    <edge id="north_in"  from="north"  to="center" priority="2" numLanes="1" speed="3.0"/>
+    <edge id="north_out" from="center" to="north"  priority="2" numLanes="1" speed="3.0"/>
+    <edge id="south_in"  from="south"  to="center" priority="2" numLanes="1" speed="3.0"/>
+    <edge id="south_out" from="center" to="south"  priority="2" numLanes="1" speed="3.0"/>
+</edges>

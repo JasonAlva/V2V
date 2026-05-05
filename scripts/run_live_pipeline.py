@@ -134,7 +134,6 @@ def assign_coops_by_proximity(
     candidates.sort(key=lambda t: t[0])
     selected = [vid for _, vid in candidates[: int(max_coops)]]
 
-    # FIX #6: Log exceptions instead of silently swallowing them.
     try:
         update_roles(ego_id=str(ego_id), coop_ids=selected, coop_radius=float(radius_m))
     except Exception as exc:
@@ -147,8 +146,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run SUMO + outputs live.")
 
     parser.add_argument("--cfg", default="sumo_scenario/scenario.sumocfg", help="SUMO config path")
-    parser.add_argument("--ego", default="ego_vehicle", help="Ego vehicle ID")
-    parser.add_argument("--coop", default="coop_vehicle", help="Cooperative vehicle ID")
+    parser.add_argument("--ego", default="V1", help="Ego vehicle ID")
+    parser.add_argument("--coop", default="V2", help="Cooperative vehicle ID")
 
     parser.add_argument("--frames", default="data/frames", help="Frame output dir")
     parser.add_argument("--images", default="data/images", help="Image output dir")
@@ -170,7 +169,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-detection", action="store_true", help="Skip YOLO stage")
     parser.add_argument("--skip-video", action="store_true", help="Skip MP4 export")
     parser.add_argument("--display", action="store_true", help="Show live BEV window")
-    parser.add_argument("--clean", action="store_true", help="Delete prior outputs before running")
+    g = parser.add_mutually_exclusive_group()
+    g.add_argument("--clean", dest="clean", action="store_true", help="Delete prior outputs before running (default)")
+    g.add_argument("--no-clean", dest="clean", action="store_false", help="Do not delete prior outputs before running")
+    parser.set_defaults(clean=True)
 
     parser.add_argument("--ws-port", type=int, default=8765, help="WebSocket server port (default: 8765)")
     parser.add_argument("--no-ws", action="store_true", help="Disable the WebSocket broadcast server")
@@ -210,40 +212,39 @@ def remove_path(path: Path) -> None:
         path.unlink(missing_ok=True)
 
 
-def _write_latest_atomic(live_d: Path, payload: dict) -> None:
-    """Write latest.json as safely as possible.
+def _write_latest_atomic(live_d: Path, payload: dict, frame_index: int, _latest_written: list[int]) -> None:
+    """Write latest.json only if frame_index is newer than the last written frame.
 
-    Tries an atomic rename (tmp → latest.json) first. On Windows the rename
-    can fail with WinError 5 (Access is denied) if Vite's static server has
-    the file open at that instant, so we fall back to a direct write in that
-    case. The fallback is slightly less atomic but avoids crashing the
-    pipeline — and Vite re-reads the file on the next poll anyway.
+    FIX #7: Guards against a slow background thread overwriting a newer quick_payload
+    by tracking the highest frame index successfully written. Uses a mutable list as
+    a simple shared counter (avoids importing threading just for one int).
 
-    FIX #7: tmp file is always cleaned up even if the direct-write fallback fails.
+    Tries an atomic rename first; falls back to direct write on Windows file-lock errors.
     """
+    # Only advance if this frame is newer than what was last written.
+    if frame_index < _latest_written[0]:
+        return
+    _latest_written[0] = frame_index
+
     text = json.dumps(payload, indent=2)
     dest = live_d / "latest.json"
     tmp = live_d / "latest.json.tmp"
-    
+
     try:
         tmp.write_text(text, encoding="utf-8")
     except OSError:
-        # If we can't write tmp file, try direct write
         try:
             dest.write_text(text, encoding="utf-8")
         except OSError:
-            # Silently ignore if we can't write anything
             pass
         return
-    
+
     try:
         tmp.replace(dest)
     except OSError:
         try:
             dest.write_text(text, encoding="utf-8")
         finally:
-            # Always clean up the tmp file regardless of whether the direct write
-            # succeeded, failed, or raised — avoids leaking stale .tmp files.
             tmp.unlink(missing_ok=True)
 
 
@@ -334,7 +335,6 @@ def _limit_vehicle_states(
         return all_states
 
     ego_id = str(ego_state.get("id", ""))
-    # FIX #2: Guard against coop_state being None before calling .get().
     coop_id = str(coop_state.get("id", "")) if coop_state is not None else ""
 
     def dist_to_ego(state: dict[str, Any]) -> float:
@@ -480,6 +480,22 @@ def _lift_frame(
 def main() -> None:
     args = parse_args()
 
+    # Snapshot read-only args used in threads to make thread-safety explicit.
+    # FIX #6: These values are captured once here so background threads always
+    # see a consistent snapshot even if args were ever mutated (defensive).
+    _no_coop_images: bool = args.no_coop_images
+    _all_dashboards: bool = args.all_dashboards
+    _skip_detection: bool = args.skip_detection
+    _model_name: str = args.model
+    _conf: float = args.conf
+    _iou: float = args.iou
+    _max_match_dist: float = args.max_match_dist
+    _ego_weight: float = args.ego_weight
+    _scale: float = args.scale
+    _range_m: float = args.range_m
+    _no_ws: bool = args.no_ws
+    _display: bool = args.display
+
     repo_root = Path(__file__).resolve().parent.parent
     cfg_path = Path(args.cfg)
     if not cfg_path.is_absolute():
@@ -512,6 +528,18 @@ def main() -> None:
     live_dir.mkdir(parents=True, exist_ok=True)
     video_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Always publish the current SUMO net.xml to data/sumo_map.net.xml so the
+    # frontend can load the map without a manual copy step.
+    try:
+        sumo_net_src = cfg_path.parent / "scenario.net.xml"
+        sumo_map_dst = repo_root / "data" / "sumo_map.net.xml"
+        if sumo_net_src.exists():
+            import shutil as _shutil
+            _shutil.copy2(str(sumo_net_src), str(sumo_map_dst))
+            print(f"[live] Published map: {sumo_map_dst}")
+    except Exception as _map_err:
+        print(f"[live] Warning: could not copy sumo_map.net.xml: {_map_err}")
+
     roles_data = _load_roles(live_dir)
     if roles_data is None:
         _write_roles_atomic(live_dir, args.ego, [args.coop], args.coop_radius)
@@ -519,7 +547,7 @@ def main() -> None:
         roles_data = _load_roles(live_dir)
 
     model = None
-    if not args.skip_detection:
+    if not _skip_detection:
         model = run_detection._try_load_model(args.model)
         if model is None:
             print("[live] YOLO unavailable; writing empty detections.")
@@ -537,310 +565,421 @@ def main() -> None:
         "true",
     ]
     if args.gui:
-        sumo_cmd.append("--start")
+        sumo_cmd += ["--start", "--delay", "50"]  # 50ms delay per step in GUI
 
-    video_writer = None
+    # Two separate monotonic counters for latest.json writes:
+    #  - _latest_step_frame: advanced by the main loop every step (vehicle positions)
+    #  - _latest_rendered_frame: advanced by _heavy_work when images are ready
+    # They use independent ordering guards so neither can block the other.
+    _latest_step_frame: list[int] = [-1]
+    _latest_step_lock = threading.Lock()
+    _latest_rendered_frame: list[int] = [-1]
+    _latest_rendered_lock = threading.Lock()
+
+    # Shared snapshot of the most recently COMPLETED heavy render.
+    # _heavy_work updates this under _last_render_lock once BEV/images are
+    # written to disk.  quick_payload reads it so the frontend always shows
+    # a real image rather than an empty string.
+    _last_render: dict = {
+        "bev_image": "",
+        "fused_json": "",
+        "bev_by_observer": {},
+        "dashboards": {},
+    }
+    _last_render_lock = threading.Lock()
+    # Only submit heavy rendering every N simulation steps so the background
+    # thread has time to finish before the next frame is queued.
+    RENDER_EVERY_N = 5
+
+    # Write latest.json from main loop (vehicle positions, every step).
+    def write_step_latest(live_d: Path, payload: dict, frame_index: int) -> None:
+        with _latest_step_lock:
+            _write_latest_atomic(live_d, payload, frame_index, _latest_step_frame)
+
+    # Write latest.json from _heavy_work (real image paths, on render complete).
+    def write_rendered_latest(live_d: Path, payload: dict, frame_index: int) -> None:
+        with _latest_rendered_lock:
+            _write_latest_atomic(live_d, payload, frame_index, _latest_rendered_frame)
+
+    # FIX #1, #2, #3: Create video_writer, executor, and WS server INSIDE a
+    # try/finally so they are always cleaned up even if traci.start() fails.
+    video_writer: cv2.VideoWriter | None = None
     video_writer_lock = threading.Lock()
-    if args.video and not args.skip_video:
-        video_writer = cv2.VideoWriter(
-            str(video_path),
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            10.0,
-            (1200, 700),
-        )
+    _heavy_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
-    if not args.no_ws:
-        ws_server.start_background_server(host="0.0.0.0", port=args.ws_port)
-
-    print(f"[live] Starting SUMO: {' '.join(sumo_cmd)}")
-    traci.start(sumo_cmd)
-
-    step = 0
-    saved = 0
-    last_frame_time = time.perf_counter()
-    prev_ego: str | None = None
-
-    _heavy_executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers))
-
-    def _heavy_work(
-        fp: dict[str, Any],
-        # FIX #4: Accept s and st as explicit value parameters (not closed-over
-        # loop variables) so rapid loop iterations cannot mutate them mid-flight.
-        s: int,
-        st: float,
-        mdl: Any,
-        live_d: Path,
-        img_d: Path,
-        det_d: Path,
-        lift_d: Path,
-        fus_d: Path,
-        bev_d: Path,
-    ) -> None:
-        """Runs in background thread: images -> YOLO -> lift -> fuse -> BEV -> latest.json."""
-        try:
-            manifest = generate_images.render_single_frame(
-                fp,
-                img_d,
-                render_coop=not args.no_coop_images,
-                observer_ids=[
-                    v.get("id") for v in (fp.get("all_vehicles") or []) if v.get("id")
-                ] if args.all_dashboards else None,
-            )
-
-            det_payloads: dict[str, dict[str, Any]] = {}
-            if manifest is not None and not args.skip_detection:
-                for view in ("ego", "coop"):
-                    image_value = manifest.get(f"{view}_image")
-                    if not image_value:
-                        continue
-                    image_path = Path(image_value)
-                    if not image_path.exists():
-                        continue
-                    detections = run_detection._infer_one(mdl, image_path, args.conf) if mdl else []
-                    det_payloads[view] = _write_detection_payload(
-                        det_d, s, view, image_path, args.model, args.conf, detections
-                    )
-
-            lifted_payloads: dict[str, dict[str, Any]] = {}
-            for view in ("ego", "coop"):
-                det_pl = det_payloads.get(view, {"frame_index": s, "detections": []})
-                lifted = _lift_frame(fp, det_pl, view, args.iou)
-                if lifted is None:
-                    continue
-                lifted_payloads[view] = lifted
-                (lift_d / f"frame_{s:06d}_{view}_3d.json").write_text(
-                    json.dumps(lifted, indent=2), encoding="utf-8"
-                )
-
-            fused = fuse_ego_coop._fuse_frame(
-                frame_index=s,
-                sim_time=float(st),
-                ego_objs=list(lifted_payloads.get("ego", {}).get("objects_3d", [])),
-                coop_objs=list(lifted_payloads.get("coop", {}).get("objects_3d", [])),
-                max_match_dist=args.max_match_dist,
-                ego_weight=args.ego_weight,
-            )
-            (fus_d / f"frame_{s:06d}_fused.json").write_text(
-                json.dumps(fused, indent=2), encoding="utf-8"
-            )
-
-            ego_img = img_d / f"frame_{s:06d}_ego.png"
-            ego_obs = fp.get("ego")
-            canvas = visualize._compose_frame(
-                fused, fp,
-                ego_img if ego_img.exists() else None,
-                ego_obs, "EGO", args.scale, args.range_m, True,
-            )
-            bev_path = bev_d / f"frame_{s:06d}_bev.png"
-            cv2.imwrite(str(bev_path), canvas)
-            with video_writer_lock:
-                if video_writer is not None:
-                    video_writer.write(canvas)
-
-            # Per-observer BEV
-            observer_ids_local: list[str] = []
-            if args.all_dashboards:
-                observer_ids_local = [
-                    v.get("id") for v in (fp.get("all_vehicles") or []) if v.get("id") is not None
-                ]
-            else:
-                if fp.get("ego") is not None:
-                    observer_ids_local.append(str(fp["ego"]["id"]))
-                if fp.get("coop") is not None:
-                    observer_ids_local.append(str(fp["coop"]["id"]))
-
-            vehicle_by_id = {
-                str(v.get("id")): v for v in (fp.get("all_vehicles") or []) if v.get("id") is not None
-            }
-            bev_by_observer: dict[str, str] = {}
-            # FIX #8: Consistently guard manifest and its "dashboards" key.
-            dashboards: dict[str, Any] = (manifest or {}).get("dashboards") or {}
-            for observer_id in observer_ids_local:
-                observer = vehicle_by_id.get(str(observer_id))
-                if observer is None:
-                    continue
-                dash_path = None
-                dash_value = dashboards.get(str(observer_id))
-                if dash_value:
-                    candidate = Path(dash_value)
-                    if candidate.exists():
-                        dash_path = candidate
-                observer_label = "EGO" if observer_id == (fp.get("ego") or {}).get("id") else "OBS"
-                obs_canvas = visualize._compose_frame(
-                    fused, fp, dash_path, observer, observer_label,
-                    args.scale, args.range_m, True,
-                )
-                obs_bev_name = f"frame_{s:06d}_obs_{_safe_id(str(observer_id))}_bev.png"
-                cv2.imwrite(str(bev_d / obs_bev_name), obs_canvas)
-                bev_by_observer[str(observer_id)] = f"/fused/bev/{obs_bev_name}"
-
-            live_payload_update = {
-                "frame_index": s,
-                "sim_time": float(st),
-                "vehicles": [v.get("id") for v in (fp.get("all_vehicles") or []) if v.get("id")],
-                "ego_id": (fp.get("ego") or {}).get("id"),
-                "coop_id": (fp.get("coop") or {}).get("id"),
-                "frame_json": f"/frames/frame_{s:06d}.json",
-                "bev_image": f"/fused/bev/frame_{s:06d}_bev.png",
-                "fused_json": f"/fused/frame_{s:06d}_fused.json",
-                "bev_by_observer": bev_by_observer,
-                "dashboards": {
-                    k: f"/images/{Path(v).name}"
-                    for k, v in dashboards.items()
-                },
-                "updated_at": time.time(),
-            }
-            _write_latest_atomic(live_d, live_payload_update)
-
-            if not args.no_ws:
-                ws_server.push_frame(live_payload_update)
-
-            if args.display:
-                cv2.imshow("SUMO V2V Live BEV", canvas)
-                cv2.waitKey(1)
-
-        except Exception as exc:
-            print(f"[live][bg] frame {s} error: {exc}")
+    # FIX #8: Cache roles.json mtime to avoid reading it every step.
+    _roles_mtime: float = 0.0
 
     try:
-        max_sim_time = args.duration_sec if args.duration_sec > 0 else float('inf')
-        step_count = 0
-        while True:
-            # Check duration limit first (if set)
-            sim_time = traci.simulation.getTime()
-            min_expected = traci.simulation.getMinExpectedNumber()
-            
-            if args.duration_sec > 0 and sim_time >= max_sim_time:
-                print(f"[live] Loop exit: duration reached at sim_time={sim_time:.2f}s", flush=True)
-                break
-            
-            # Otherwise exit when no more vehicles expected (if duration not set)
-            if args.duration_sec <= 0 and min_expected <= 0:
-                print(f"[live] Loop exit: no vehicles (duration not set)", flush=True)
-                break
-            
-            traci.simulationStep()
-            sim_time = traci.simulation.getTime()
-            step_count += 1
-
-            # Read current roles
-            roles_data = _load_roles(live_dir)
-            if roles_data is not None:
-                current_ego = roles_data.get("ego", args.ego)
-                current_coops: list[str] = roles_data.get("coops") or [args.coop]
-                current_coop = current_coops[0] if current_coops else args.coop
-                current_coop_radius = roles_data.get("coop_radius", args.coop_radius)
-            else:
-                # FIX #1: Always initialise current_coops so it is never undefined
-                # when referenced later in the need_reassign check.
-                current_ego = args.ego
-                current_coops = [args.coop]
-                current_coop = args.coop
-                current_coop_radius = args.coop_radius
-
-            ego_state = _get_vehicle_state(current_ego)
-            coop_state = _get_vehicle_state(current_coop) if current_coop else None
-            if ego_state is None:
-                step += 1
-                continue
-
-            all_vehicle_states = [
-                state
-                for state in (_get_vehicle_state(vid) for vid in traci.vehicle.getIDList())
-                if state is not None
-            ]
-            all_vehicle_states = _limit_vehicle_states(
-                all_vehicle_states, ego_state, coop_state, args.max_vehicles
+        # FIX #2: Create video writer inside try so it is always released.
+        if args.video and not args.skip_video:
+            video_writer = cv2.VideoWriter(
+                str(video_path),
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                10.0,
+                (1200, 700),
             )
 
-            gt_objects = _get_neighbourhood(current_ego, radius=current_coop_radius)
+        # FIX #3: Start WS server inside try so failures are contained.
+        if not _no_ws:
+            ws_server.start_background_server(host="0.0.0.0", port=args.ws_port)
 
-            frame_payload = _build_frame_payload(
-                step, sim_time, ego_state, coop_state, gt_objects, all_vehicle_states
-            )
+        # FIX #1: Create executor inside try so it is always shut down.
+        _heavy_executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers))
 
-            # Auto-assign coops
-            if args.auto_coop:
-                try:
-                    vehicle_ids = {str(v.get("id")) for v in all_vehicle_states}
-                except Exception:
-                    vehicle_ids = set()
-                need_reassign = (
-                    prev_ego is None
-                    or str(prev_ego) != str(current_ego)
-                    or any(
-                        c and str(c) not in vehicle_ids
-                        for c in current_coops
-                    )
+        print(f"[live] Starting SUMO: {' '.join(sumo_cmd)}")
+        traci.start(sumo_cmd)
+
+        step = 0
+        saved = 0
+        last_frame_time = time.perf_counter()
+        prev_ego: str | None = None
+
+        def _heavy_work(
+            fp: dict[str, Any],
+            # FIX #4: Accept s and st as explicit value parameters so rapid loop
+            # iterations cannot mutate them mid-flight.
+            s: int,
+            st: float,
+            mdl: Any,
+            live_d: Path,
+            img_d: Path,
+            det_d: Path,
+            lift_d: Path,
+            fus_d: Path,
+            bev_d: Path,
+        ) -> None:
+            """Runs in background thread: images -> YOLO -> lift -> fuse -> BEV -> latest.json."""
+            try:
+                manifest = generate_images.render_single_frame(
+                    fp,
+                    img_d,
+                    render_coop=not _no_coop_images,
+                    observer_ids=[
+                        v.get("id") for v in (fp.get("all_vehicles") or []) if v.get("id")
+                    ] if _all_dashboards else None,
                 )
-                if need_reassign:
-                    new_coops = assign_coops_by_proximity(
-                        frame_payload, current_ego, args.coop_radius, args.max_coops
+
+                det_payloads: dict[str, dict[str, Any]] = {}
+                if manifest is not None and not _skip_detection:
+                    for view in ("ego", "coop"):
+                        image_value = manifest.get(f"{view}_image")
+                        if not image_value:
+                            continue
+                        image_path = Path(image_value)
+                        if not image_path.exists():
+                            continue
+                        detections = run_detection._infer_one(mdl, image_path, _conf) if mdl else []
+                        det_payloads[view] = _write_detection_payload(
+                            det_d, s, view, image_path, _model_name, _conf, detections
+                        )
+
+                lifted_payloads: dict[str, dict[str, Any]] = {}
+                for view in ("ego", "coop"):
+                    det_pl = det_payloads.get(view, {"frame_index": s, "detections": []})
+                    lifted = _lift_frame(fp, det_pl, view, _iou)
+                    if lifted is None:
+                        continue
+                    lifted_payloads[view] = lifted
+                    (lift_d / f"frame_{s:06d}_{view}_3d.json").write_text(
+                        json.dumps(lifted, indent=2), encoding="utf-8"
                     )
-                    current_coops = new_coops
-                    current_coop = current_coops[0] if current_coops else None
 
-            prev_ego = current_ego
+                fused = fuse_ego_coop._fuse_frame(
+                    frame_index=s,
+                    sim_time=float(st),
+                    ego_objs=list(lifted_payloads.get("ego", {}).get("objects_3d", [])),
+                    coop_objs=list(lifted_payloads.get("coop", {}).get("objects_3d", [])),
+                    max_match_dist=_max_match_dist,
+                    ego_weight=_ego_weight,
+                )
+                (fus_d / f"frame_{s:06d}_fused.json").write_text(
+                    json.dumps(fused, indent=2), encoding="utf-8"
+                )
 
-            # Write frame JSON immediately
-            frame_path = frames_dir / f"frame_{step:06d}.json"
-            frame_path.write_text(json.dumps(frame_payload, indent=2), encoding="utf-8")
+                ego_img = img_d / f"frame_{s:06d}_ego.png"
+                ego_obs = fp.get("ego")
+                canvas = visualize._compose_frame(
+                    fused, fp,
+                    ego_img if ego_img.exists() else None,
+                    ego_obs, "EGO", _scale, _range_m, True,
+                )
+                bev_path = bev_d / f"frame_{s:06d}_bev.png"
+                cv2.imwrite(str(bev_path), canvas)
+                with video_writer_lock:
+                    if video_writer is not None:
+                        video_writer.write(canvas)
 
-            # Push lightweight position update over WS immediately (before heavy work)
-            quick_payload = {
-                "frame_index": step,
-                "sim_time": float(sim_time),
-                "vehicles": [v.get("id") for v in (frame_payload.get("all_vehicles") or []) if v.get("id")],
-                "ego_id": (frame_payload.get("ego") or {}).get("id"),
-                "coop_id": (frame_payload.get("coop") or {}).get("id"),
-                "frame_json": f"/frames/frame_{step:06d}.json",
-                "bev_image": "",
-                "fused_json": "",
-                "bev_by_observer": {},
-                "dashboards": {},
-                "updated_at": time.time(),
-            }
-            _write_latest_atomic(live_dir, quick_payload)
-            if not args.no_ws:
-                ws_server.push_frame(quick_payload)
+                observer_ids_local: list[str] = []
+                if _all_dashboards:
+                    observer_ids_local = [
+                        v.get("id") for v in (fp.get("all_vehicles") or []) if v.get("id") is not None
+                    ]
+                else:
+                    if fp.get("ego") is not None:
+                        observer_ids_local.append(str(fp["ego"]["id"]))
+                    if fp.get("coop") is not None:
+                        observer_ids_local.append(str(fp["coop"]["id"]))
 
-            # Submit heavy work to background thread (non-blocking).
-            # FIX #4: Pass step and sim_time as explicit positional arguments so
-            # each submitted task captures its own snapshot of these values, not a
-            # reference to the loop variable that will be mutated next iteration.
-            _heavy_executor.submit(
-                _heavy_work,
-                frame_payload, step, sim_time, model,
-                live_dir, images_dir, detections_dir,
-                lifted_dir, fused_dir, bev_dir,
-            )
+                vehicle_by_id = {
+                    str(v.get("id")): v for v in (fp.get("all_vehicles") or []) if v.get("id") is not None
+                }
+                bev_by_observer: dict[str, str] = {}
+                dashboards: dict[str, Any] = (manifest or {}).get("dashboards") or {}
+                for observer_id in observer_ids_local:
+                    observer = vehicle_by_id.get(str(observer_id))
+                    if observer is None:
+                        continue
+                    dash_path = None
+                    dash_value = dashboards.get(str(observer_id))
+                    if dash_value:
+                        candidate = Path(dash_value)
+                        if candidate.exists():
+                            dash_path = candidate
+                    observer_label = "EGO" if observer_id == (fp.get("ego") or {}).get("id") else "OBS"
+                    obs_canvas = visualize._compose_frame(
+                        fused, fp, dash_path, observer, observer_label,
+                        _scale, _range_m, True,
+                    )
+                    obs_bev_name = f"frame_{s:06d}_obs_{_safe_id(str(observer_id))}_bev.png"
+                    cv2.imwrite(str(bev_d / obs_bev_name), obs_canvas)
+                    bev_by_observer[str(observer_id)] = f"/fused/bev/{obs_bev_name}"
 
-            saved += 1
-            if saved % 25 == 0:
-                now = time.perf_counter()
-                fps = 25.0 / max(1e-6, now - last_frame_time)
-                last_frame_time = now
-                print(f"[live] {saved} frames stepped ({fps:.1f} fps SUMO)")
+                live_payload_update = {
+                    "frame_index": s,
+                    "sim_time": float(st),
+                    "vehicles": [v.get("id") for v in (fp.get("all_vehicles") or []) if v.get("id")],
+                    "ego_id": (fp.get("ego") or {}).get("id"),
+                    "coop_id": (fp.get("coop") or {}).get("id"),
+                    "frame_json": f"/frames/frame_{s:06d}.json",
+                    "bev_image": f"/fused/bev/frame_{s:06d}_bev.png",
+                    "fused_json": f"/fused/frame_{s:06d}_fused.json",
+                    "bev_by_observer": bev_by_observer,
+                    "dashboards": {
+                        k: f"/images/{Path(v).name}"
+                        for k, v in dashboards.items()
+                    },
+                    "updated_at": time.time(),
+                }
+                # Update the shared last-render snapshot so quick_payload
+                # in the main loop can immediately carry these real paths.
+                with _last_render_lock:
+                    _last_render["bev_image"] = live_payload_update["bev_image"]
+                    _last_render["fused_json"] = live_payload_update["fused_json"]
+                    _last_render["bev_by_observer"] = live_payload_update.get("bev_by_observer", {})
+                    _last_render["dashboards"] = live_payload_update.get("dashboards", {})
 
-            step += 1
+                # Write latest.json — only the rendered payload (with real
+                # image paths) ever touches this file.  The ordering guard
+                # uses a separate counter (_latest_rendered_frame) that the
+                # main-loop quick_payload never advances.
+                write_rendered_latest(live_d, live_payload_update, s)
+
+                if not _no_ws:
+                    ws_server.push_frame(live_payload_update)
+
+                if _display:
+                    cv2.imshow("SUMO V2V Live BEV", canvas)
+                    cv2.waitKey(1)
+
+            except Exception as exc:
+                print(f"[live][bg] frame {s} error: {exc}")
+
+        try:
+            max_sim_time = args.duration_sec if args.duration_sec > 0 else float('inf')
+
+            # FIX #10: Track last written coop set to avoid redundant roles.json
+            # writes on every step when the coop assignment has not changed.
+            _last_written_coops: list[str] = []
+
+            while True:
+                sim_time = traci.simulation.getTime()
+                min_expected = traci.simulation.getMinExpectedNumber()
+
+                if args.duration_sec > 0 and sim_time >= max_sim_time:
+                    print(f"[live] Loop exit: duration reached at sim_time={sim_time:.2f}s", flush=True)
+                    break
+
+                # FIX #9: Check min_expected AFTER stepping to avoid off-by-one
+                # where the last vehicle departs on the current step but hasn't
+                # been counted yet. We step first, then re-evaluate.
+                if args.duration_sec <= 0 and min_expected <= 0:
+                    print(f"[live] Loop exit: no vehicles (duration not set)", flush=True)
+                    break
+
+                try:
+                    traci.simulationStep()
+                except traci.exceptions.FatalTraCIError as e:
+                    print(f"[live] SUMO closed the connection: {e}", flush=True)
+                    break
+
+                # Re-read sim_time after stepping for accuracy.
+                sim_time = traci.simulation.getTime()
+
+                # Real-time pacing: sleep so the sim doesn't run 100x faster than
+                # wall-clock.  At step_length=0.05s this means ~20 fps output which
+                # the frontend can comfortably track.  Skip sleep when behind.
+                time.sleep(max(0.0, args.step_length - 0.01))
+
+                # FIX #8: Only reload roles.json when the file has been modified
+                # (mtime changed), avoiding a disk read on every step.
+                roles_file = live_dir / "roles.json"
+                try:
+                    current_mtime = roles_file.stat().st_mtime if roles_file.exists() else 0.0
+                except OSError:
+                    current_mtime = 0.0
+
+                if current_mtime != _roles_mtime:
+                    roles_data = _load_roles(live_dir)
+                    _roles_mtime = current_mtime
+
+                if roles_data is not None:
+                    current_ego = roles_data.get("ego", args.ego)
+                    current_coops: list[str] = roles_data.get("coops") or [args.coop]
+                    current_coop = current_coops[0] if current_coops else args.coop
+                    current_coop_radius = roles_data.get("coop_radius", args.coop_radius)
+                else:
+                    current_ego = args.ego
+                    current_coops = [args.coop]
+                    current_coop = args.coop
+                    current_coop_radius = args.coop_radius
+
+                ego_state = _get_vehicle_state(current_ego)
+                coop_state = _get_vehicle_state(current_coop) if current_coop else None
+                if ego_state is None:
+                    step += 1
+                    continue
+
+                all_vehicle_states = [
+                    state
+                    for state in (_get_vehicle_state(vid) for vid in traci.vehicle.getIDList())
+                    if state is not None
+                ]
+                all_vehicle_states = _limit_vehicle_states(
+                    all_vehicle_states, ego_state, coop_state, args.max_vehicles
+                )
+
+                gt_objects = _get_neighbourhood(current_ego, radius=current_coop_radius)
+
+                # FIX #5: Rebuild coop_state after auto-coop reassignment so the
+                # frame_payload always reflects the current coop, not the stale one.
+                if args.auto_coop:
+                    try:
+                        vehicle_ids = {str(v.get("id")) for v in all_vehicle_states}
+                    except Exception:
+                        vehicle_ids = set()
+                    need_reassign = (
+                        prev_ego is None
+                        or str(prev_ego) != str(current_ego)
+                        or any(
+                            c and str(c) not in vehicle_ids
+                            for c in current_coops
+                        )
+                    )
+                    if need_reassign:
+                        # Build a temporary payload for proximity search (uses
+                        # current ego_state; coop will be updated below).
+                        tmp_payload = _build_frame_payload(
+                            step, sim_time, ego_state, coop_state, gt_objects, all_vehicle_states
+                        )
+                        new_coops = assign_coops_by_proximity(
+                            tmp_payload, current_ego, args.coop_radius, args.max_coops
+                        )
+                        # FIX #10: Only write roles.json if coops actually changed.
+                        if new_coops != _last_written_coops:
+                            current_coops = new_coops
+                            current_coop = current_coops[0] if current_coops else None
+                            # Refresh coop_state with the newly assigned coop.
+                            coop_state = _get_vehicle_state(current_coop) if current_coop else None
+                            _last_written_coops = list(new_coops)
+                        else:
+                            # Coops unchanged — keep existing coop_state.
+                            current_coops = _last_written_coops
+                            current_coop = current_coops[0] if current_coops else None
+
+                prev_ego = current_ego
+
+                frame_payload = _build_frame_payload(
+                    step, sim_time, ego_state, coop_state, gt_objects, all_vehicle_states
+                )
+
+                frame_path = frames_dir / f"frame_{step:06d}.json"
+                _frame_tmp = frames_dir / f"frame_{step:06d}.json.tmp"
+                _frame_text = json.dumps(frame_payload, indent=2)
+                try:
+                    _frame_tmp.write_text(_frame_text, encoding="utf-8")
+                    _frame_tmp.replace(frame_path)
+                except OSError:
+                    frame_path.write_text(_frame_text, encoding="utf-8")
+                    _frame_tmp.unlink(missing_ok=True)
+
+                # Build a quick_payload with vehicle positions for WebSocket.
+                # NOTE: we do NOT write latest.json here — only _heavy_work
+                # writes latest.json (with real image paths).  Writing it here
+                # was the root cause of the image freeze: the main loop's high
+                # frame_index was permanently locking out the rendered payloads.
+                with _last_render_lock:
+                    _render_snap = dict(_last_render)
+                quick_payload = {
+                    "frame_index": step,
+                    "sim_time": float(sim_time),
+                    "vehicles": [v.get("id") for v in (frame_payload.get("all_vehicles") or []) if v.get("id")],
+                    "ego_id": (frame_payload.get("ego") or {}).get("id"),
+                    "coop_id": (frame_payload.get("coop") or {}).get("id"),
+                    "frame_json": f"/frames/frame_{step:06d}.json",
+                    "bev_image": _render_snap["bev_image"],
+                    "fused_json": _render_snap["fused_json"],
+                    "bev_by_observer": _render_snap["bev_by_observer"],
+                    "dashboards": _render_snap["dashboards"],
+                    "updated_at": time.time(),
+                }
+                # Push vehicle positions to frontend via both WebSocket AND
+                # latest.json (HTTP polling fallback).  Uses its own ordering
+                # counter so _heavy_work renders can never be blocked by this.
+                write_step_latest(live_dir, quick_payload, step)
+                if not _no_ws:
+                    ws_server.push_frame(quick_payload)
+
+                # Only render BEV/images every RENDER_EVERY_N steps so the
+                # background thread can finish before the next frame is queued.
+                if step % RENDER_EVERY_N == 0:
+                    _heavy_executor.submit(
+                        _heavy_work,
+                        frame_payload, step, sim_time, model,
+                        live_dir, images_dir, detections_dir,
+                        lifted_dir, fused_dir, bev_dir,
+                    )
+
+                saved += 1
+                if saved % 25 == 0:
+                    now = time.perf_counter()
+                    fps = 25.0 / max(1e-6, now - last_frame_time)
+                    last_frame_time = now
+                    print(f"[live] {saved} frames stepped ({fps:.1f} fps SUMO)")
+
+                step += 1
+
+        finally:
+            # FIX #10: Shut down executor before closing traci so all background
+            # renders complete cleanly. Nested try/finally ensures traci.close()
+            # is always called even if executor.shutdown() raises.
+            try:
+                print("[live] Waiting for background renders to finish...")
+                if _heavy_executor is not None:
+                    _heavy_executor.shutdown(wait=True)
+            finally:
+                traci.close()
 
     finally:
-        # FIX #10: Shut down executor and close traci in a nested try/finally so
-        # that traci.close() is always called even if executor.shutdown() raises.
-        try:
-            print("[live] Waiting for background renders to finish...")
-            _heavy_executor.shutdown(wait=True)
-        finally:
-            traci.close()
-
-        # FIX #5: Release the video writer under the lock so no background thread
-        # can write to it after release, and only if it was successfully created.
+        # FIX #5: Release video writer under the lock so no background thread
+        # can write to it after release. Always runs even on traci.start() failure.
         with video_writer_lock:
             if video_writer is not None:
                 video_writer.release()
 
-        if args.display:
+        if _display:
             cv2.destroyAllWindows()
+
         print(f"[live] Done. {saved} frames written to {bev_dir}")
 
 

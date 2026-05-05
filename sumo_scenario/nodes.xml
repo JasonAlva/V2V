@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<nodes>
+    <!-- Center intersection (traffic light) -->
+    <node id="center" x="0"    y="0"    type="traffic_light"/>
+    <!-- Four arm endpoints -->
+    <node id="north"  x="0"    y="300"  type="dead_end"/>
+    <node id="south"  x="0"    y="-300" type="dead_end"/>
+    <node id="east"   x="300"  y="0"    type="dead_end"/>
+    <node id="west"   x="-300" y="0"    type="dead_end"/>
+</nodes>

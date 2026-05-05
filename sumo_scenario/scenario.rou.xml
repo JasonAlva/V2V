@@ -1,27 +1,97 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <routes>
-  <!-- Small square map with very slow speeds for V2V demo -->
-  <vType id="car" accel="0.5" decel="1.5" sigma="0.1" tau="2.0" minGap="2.0" length="4.8" width="1.9" maxSpeed="2.0" color="0,90,220"/>
-  <vType id="truck" accel="0.3" decel="1.0" sigma="0.1" tau="2.2" minGap="3.0" length="12.0" width="2.5" maxSpeed="1.5" color="80,80,80"/>
-  <vType id="coopCar" accel="0.4" decel="1.2" sigma="0.1" tau="2.0" minGap="2.0" length="4.8" width="1.9" maxSpeed="1.8" color="0,190,0"/>
 
-  <!-- Simple square loop: A1->B1->B0->A0->A1 forming a continuous circuit -->
-  <!-- Simplified for testing: single-edge route so SUMO doesn't fail on connectivity in minimal net -->
-  <route id="square_loop" edges="A0A1"/>
+  <!-- ══════════════════════════════════════════════════════
+       VEHICLE TYPES  — slow crawl (maxSpeed 1.0 m/s ≈ 3.6 km/h)
+       Colors match the reference image legend
+       ══════════════════════════════════════════════════════ -->
 
-  <!-- EGO: Main vehicle (primary observer) -->
-  <vehicle id="EGO_1" type="car" route="square_loop" depart="0.0" departLane="0" departPos="10" departSpeed="1.8"/>
+  <!-- V1: ego (blue/cyan) — front camera vehicle -->
+  <vType id="ego"
+         length="4.5" width="1.9" height="1.5"
+         accel="0.5" decel="0.5" sigma="0.0" tau="2.0" minGap="2.0"
+         maxSpeed="1.0" color="0,120,255"/>
 
-  <!-- COOP: Cooperative vehicle (supports EGO) -->
-  <vehicle id="COOP_2" type="coopCar" route="square_loop" depart="2.0" departLane="0" departPos="40" departSpeed="1.7"/>
+  <!-- V2/V5: same direction (green) -->
+  <vType id="same_dir"
+         length="4.5" width="1.9" height="1.5"
+         accel="0.5" decel="0.5" sigma="0.0" tau="2.0" minGap="2.0"
+         maxSpeed="1.0" color="0,180,60"/>
 
-  <!-- TRUCK_1: Occluder vehicle -->
-  <vehicle id="TRUCK_1" type="truck" route="square_loop" depart="4.0" departLane="0" departPos="70" departSpeed="1.4"/>
+  <!-- V3/V6: oncoming (red / dark-red) -->
+  <vType id="oncoming"
+         length="4.5" width="1.9" height="1.5"
+         accel="0.5" decel="0.5" sigma="0.0" tau="2.0" minGap="2.0"
+         maxSpeed="1.0" color="200,50,30"/>
 
-  <!-- TARGET_3: Hidden vehicle (often occluded) -->
-  <vehicle id="TARGET_3" type="car" route="square_loop" depart="6.0" departLane="0" departPos="100" departSpeed="1.6"/>
+  <vType id="oncoming2"
+         length="4.5" width="1.9" height="1.5"
+         accel="0.5" decel="0.5" sigma="0.0" tau="2.0" minGap="2.0"
+         maxSpeed="1.0" color="140,0,0"/>
 
-  <!-- CROSS_4: Additional traffic -->
-  <vehicle id="CROSS_4" type="car" route="square_loop" depart="8.0" departLane="0" departPos="150" departSpeed="1.5"/>
+  <!-- V4: crossing (orange) -->
+  <vType id="crossing"
+         length="4.5" width="1.9" height="1.5"
+         accel="0.5" decel="0.5" sigma="0.0" tau="2.0" minGap="2.0"
+         maxSpeed="1.0" color="210,120,0"/>
+
+  <!-- V7: crossing (dark green) -->
+  <vType id="crossing2"
+         length="4.5" width="1.9" height="1.5"
+         accel="0.5" decel="0.5" sigma="0.0" tau="2.0" minGap="2.0"
+         maxSpeed="1.0" color="0,160,50"/>
+
+  <!-- V5: same direction far-east (purple) -->
+  <vType id="same_dir2"
+         length="4.5" width="1.9" height="1.5"
+         accel="0.5" decel="0.5" sigma="0.0" tau="2.0" minGap="2.0"
+         maxSpeed="1.0" color="120,0,200"/>
+
+  <!-- ══════════════════════════════════════════════════════
+       ROUTES — straight through the intersection
+       ══════════════════════════════════════════════════════ -->
+  <!-- Going East: enter from West arm, exit to East arm -->
+  <route id="east_bound"  edges="west_in east_out"/>
+  <!-- Going West: enter from East arm, exit to West arm -->
+  <route id="west_bound"  edges="east_in west_out"/>
+  <!-- Going South: enter from North arm, exit to South arm -->
+  <route id="south_bound" edges="north_in south_out"/>
+  <!-- Going North: enter from South arm, exit to North arm -->
+  <route id="north_bound" edges="south_in north_out"/>
+  <!-- Already East of intersection, continuing East -->
+  <route id="east_only"   edges="east_out"/>
+
+  <!-- ══════════════════════════════════════════════════════
+       VEHICLES  — positions match the reference image
+       departPos is distance from the "from" node of the edge
+       ══════════════════════════════════════════════════════ -->
+
+  <!-- V1: ego, blue — on West arm ~2/3 from west end, going East -->
+  <vehicle id="V1" type="ego"       route="east_bound"  depart="0"
+           departLane="0" departPos="70"  departSpeed="1.0"/>
+
+  <!-- V2: same dir, green — ahead of V1 on West arm, going East -->
+  <vehicle id="V2" type="same_dir"  route="east_bound"  depart="0"
+           departLane="0" departPos="145" departSpeed="1.0"/>
+
+  <!-- V3: oncoming, red — East arm moving West, closer to intersection -->
+  <vehicle id="V3" type="oncoming"  route="west_bound"  depart="0"
+           departLane="0" departPos="130" departSpeed="1.0"/>
+
+  <!-- V4: crossing, orange — North arm moving South, ~halfway down -->
+  <vehicle id="V4" type="crossing"  route="south_bound" depart="0"
+           departLane="0" departPos="130" departSpeed="1.0"/>
+
+  <!-- V5: same dir, purple — already East of intersection, continuing East -->
+  <vehicle id="V5" type="same_dir2" route="east_only"   depart="0"
+           departLane="0" departPos="100" departSpeed="1.0"/>
+
+  <!-- V6: oncoming2, dark red — East arm moving West, further from center -->
+  <vehicle id="V6" type="oncoming2" route="west_bound"  depart="0"
+           departLane="0" departPos="50"  departSpeed="1.0"/>
+
+  <!-- V7: crossing2, dark green — South arm moving North, near center -->
+  <vehicle id="V7" type="crossing2" route="north_bound" depart="0"
+           departLane="0" departPos="70"  departSpeed="1.0"/>
 
 </routes>
