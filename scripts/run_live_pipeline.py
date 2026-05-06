@@ -162,7 +162,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--conf", type=float, default=0.25, help="YOLO confidence threshold")
     parser.add_argument("--gui", action="store_true", help="Run SUMO with GUI")
     parser.add_argument("--step-length", type=float, default=0.05, help="SUMO step length")
-    parser.add_argument("--duration-sec", type=float, default=0, help="Simulation duration in seconds (0 = until vehicles end; default: 0)")
+    parser.add_argument(
+        "--duration-sec",
+        type=float,
+        default=0,
+        help="Simulation duration in seconds (0 = no time limit)",
+    )
+    parser.add_argument(
+        "--exit-on-empty",
+        action="store_true",
+        help="Exit when SUMO has no remaining vehicles (default: keep alive)",
+    )
     parser.add_argument("--radius", type=float, default=80.0, help="Neighborhood radius in meters")
     parser.add_argument("--no-coop-images", action="store_true", help="Render only ego images")
 
@@ -622,7 +632,11 @@ def main() -> None:
 
         # FIX #3: Start WS server inside try so failures are contained.
         if not _no_ws:
-            ws_server.start_background_server(host="0.0.0.0", port=args.ws_port)
+            ws_server.start_background_server(
+                host="0.0.0.0",
+                port=args.ws_port,
+                data_root=repo_root / "data",
+            )
 
         # FIX #1: Create executor inside try so it is always shut down.
         _heavy_executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers))
@@ -759,6 +773,7 @@ def main() -> None:
                         k: f"/images/{Path(v).name}"
                         for k, v in dashboards.items()
                     },
+                    "render_complete": True,
                     "updated_at": time.time(),
                 }
                 # Update the shared last-render snapshot so quick_payload
@@ -786,7 +801,7 @@ def main() -> None:
                 print(f"[live][bg] frame {s} error: {exc}")
 
         try:
-            max_sim_time = args.duration_sec if args.duration_sec > 0 else float('inf')
+            max_sim_time = args.duration_sec if args.duration_sec > 0 else float("inf")
 
             # FIX #10: Track last written coop set to avoid redundant roles.json
             # writes on every step when the coop assignment has not changed.
@@ -794,17 +809,9 @@ def main() -> None:
 
             while True:
                 sim_time = traci.simulation.getTime()
-                min_expected = traci.simulation.getMinExpectedNumber()
 
                 if args.duration_sec > 0 and sim_time >= max_sim_time:
                     print(f"[live] Loop exit: duration reached at sim_time={sim_time:.2f}s", flush=True)
-                    break
-
-                # FIX #9: Check min_expected AFTER stepping to avoid off-by-one
-                # where the last vehicle departs on the current step but hasn't
-                # been counted yet. We step first, then re-evaluate.
-                if args.duration_sec <= 0 and min_expected <= 0:
-                    print(f"[live] Loop exit: no vehicles (duration not set)", flush=True)
                     break
 
                 try:
@@ -813,8 +820,14 @@ def main() -> None:
                     print(f"[live] SUMO closed the connection: {e}", flush=True)
                     break
 
-                # Re-read sim_time after stepping for accuracy.
+                # Re-read sim_time/min_expected after stepping for accuracy.
                 sim_time = traci.simulation.getTime()
+                min_expected = traci.simulation.getMinExpectedNumber()
+
+                # Exit only when explicitly requested; by default keep the loop alive.
+                if args.exit_on_empty and args.duration_sec <= 0 and min_expected <= 0:
+                    print("[live] Loop exit: no vehicles remaining", flush=True)
+                    break
 
                 # Real-time pacing: sleep so the sim doesn't run 100x faster than
                 # wall-clock.  At step_length=0.05s this means ~20 fps output which
@@ -931,6 +944,7 @@ def main() -> None:
                     "fused_json": _render_snap["fused_json"],
                     "bev_by_observer": _render_snap["bev_by_observer"],
                     "dashboards": _render_snap["dashboards"],
+                    "render_complete": False,
                     "updated_at": time.time(),
                 }
                 # Push vehicle positions to frontend via both WebSocket AND

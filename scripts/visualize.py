@@ -36,9 +36,9 @@ def _world_to_ego_local(world_x: float, world_y: float, ego: dict[str, Any]) -> 
     dx = world_x - float(ego["x"])
     dy = world_y - float(ego["y"])
     h = float(ego.get("heading_rad", 0.0))
-    x_local = dx * np.sin(h) - dy * np.cos(h)
-    y_local = dx * np.cos(h) + dy * np.sin(h)
-    return float(x_local), float(y_local)
+    forward = dx * np.cos(h) + dy * np.sin(h)
+    lateral = -dx * np.sin(h) + dy * np.cos(h)
+    return float(lateral), float(forward)
 
 
 def _local_to_canvas(x_local: float, y_local: float, width: int, height: int, scale: float) -> tuple[int, int]:

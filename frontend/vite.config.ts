@@ -4,20 +4,29 @@ import react from "@vitejs/plugin-react";
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react()],
-  publicDir: "../data",
-  // MPA mode: disables SPA HTML fallback so missing /frames/*.json, /fused/*.png, etc.
-  // return a real 404 instead of index.html, preventing "Unexpected token '<'" JSON parse errors.
+  // Simulation data is now served exclusively through the ws_server (port 8765)
+  // so Vite never races with atomic writes to latest.json / BEV images.
+  // publicDir left as default ("public") — only static frontend assets live there.
   appType: "mpa",
   server: {
     fs: {
       allow: [".."],
     },
     proxy: {
-      // Forward WebSocket upgrades to the Python WS server
+      // WebSocket upgrade for live stream
       "/ws": {
         target: "ws://localhost:8765",
         ws: true,
         rewriteWsOrigin: true,
+      },
+      // All simulation data — served by FastAPI/StaticFiles (no Vite race)
+      "/live": { target: "http://localhost:8765", changeOrigin: true },
+      "/frames": { target: "http://localhost:8765", changeOrigin: true },
+      "/fused": { target: "http://localhost:8765", changeOrigin: true },
+      "/images": { target: "http://localhost:8765", changeOrigin: true },
+      "/sumo_map.net.xml": {
+        target: "http://localhost:8765",
+        changeOrigin: true,
       },
     },
   },

@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -135,6 +136,31 @@ async def serve_sumo_map() -> FileResponse:
     if not net_file.exists():
         return FileResponse(status_code=404, path=__file__)
     return FileResponse(str(net_file), media_type="application/xml")
+
+
+@app.get("/live/latest.json")
+async def serve_latest_json() -> JSONResponse:
+    """Serve latest.json with a safe read to avoid mid-write hangs."""
+    if _data_root is None:
+        return JSONResponse({}, status_code=404)
+    latest_file = _data_root / "live" / "latest.json"
+    if not latest_file.exists():
+        return JSONResponse({}, status_code=404)
+
+    last_err: Exception | None = None
+    for _ in range(3):
+        try:
+            text = latest_file.read_text(encoding="utf-8")
+            if not text.strip():
+                return JSONResponse({}, status_code=204)
+            payload = json.loads(text)
+            return JSONResponse(payload)
+        except Exception as exc:  # pragma: no cover
+            last_err = exc
+            time.sleep(0.01)
+
+    logger.warning("[ws] latest.json read failed: %s", last_err)
+    return JSONResponse({}, status_code=204)
 
 
 # ---------------------------------------------------------------------------

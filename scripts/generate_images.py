@@ -579,14 +579,14 @@ def _to_local_frame_from_observer(raw_frame: dict[str, Any], observer: dict[str,
 
         dx = float(veh["x"]) - obs_x
         dy = float(veh["y"]) - obs_y
-        x_local = dx * math.sin(h) - dy * math.cos(h)
-        y_local = dx * math.cos(h) + dy * math.sin(h)
+        forward = dx * math.cos(h) + dy * math.sin(h)
+        lateral = -dx * math.sin(h) + dy * math.cos(h)
 
         vehicles.append(
             {
                 "id": veh_id,
-                "x": x_local,
-                "y": y_local,
+                "x": lateral,
+                "y": forward,
                 "speed": float(veh.get("speed_ms", 0.0)),
                 "angle": float(veh.get("heading_deg", 0.0)),
                 "lane": 1,

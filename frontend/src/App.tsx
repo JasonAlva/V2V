@@ -46,6 +46,7 @@ type LiveManifest = {
   bev_image: string;
   fused_json: string;
   dashboards: Record<string, string>;
+  render_complete?: boolean;
   updated_at: number;
   bev_by_observer?: Record<string, string>;
 };
@@ -279,33 +280,29 @@ function App() {
         }
         console.log(
           `[WS] frame=${payload.frame_index} t=${payload.sim_time?.toFixed(2)}s` +
-          ` vehicles=[${(payload.vehicles ?? []).join(", ")}]` +
-          ` bev=${payload.bev_image ?? "(none)"}` +
-          ` dashboards=${Object.keys(payload.dashboards ?? {}).join(", ") || "(none)"}` +
-          ` bev_by_observer=${Object.keys(payload.bev_by_observer ?? {}).join(", ") || "(none)"}`
+            ` vehicles=[${(payload.vehicles ?? []).join(", ")}]` +
+            ` bev=${payload.bev_image ?? "(none)"}` +
+            ` dashboards=${Object.keys(payload.dashboards ?? {}).join(", ") || "(none)"}` +
+            ` bev_by_observer=${Object.keys(payload.bev_by_observer ?? {}).join(", ") || "(none)"}`,
         );
         setLiveManifest(payload);
         setFrameIndex(payload.frame_index);
         // Only bump the image revision when a *real* BEV render has landed.
-        // The quick pre-render payload has an empty bev_by_observer dict and
-        // a placeholder bev_image path that may not exist yet.  The finished
-        // payload (pushed by _heavy_work) carries real dashboards/bev_by_observer
-        // entries AND a distinct bev_image.  Using the presence of dashboards or
-        // bev_by_observer content as the signal prevents the browser from
-        // hammering 404s on in-flight paths.
-        const hasRealRender =
-          (payload.bev_image &&
-            payload.bev_image !== lastBevImageRef.current) ||
-          Object.keys(payload.dashboards ?? {}).length > 0 ||
-          Object.keys(payload.bev_by_observer ?? {}).length > 0;
+        // quick_payload keeps the previous render paths; rendered payloads
+        // explicitly set render_complete=true so we can gate cache-busting.
+        const hasRealRender = !!(
+          payload.render_complete === true &&
+          payload.bev_image &&
+          payload.bev_image !== lastBevImageRef.current
+        );
         if (hasRealRender) {
           lastBevImageRef.current = payload.bev_image ?? "";
           imgRevisionRef.current += 1;
           setImgRevision(imgRevisionRef.current);
           console.log(
-            `[WS] 🖼️  Real render detected — bumping image revision to ${imgRevisionRef.current}` +
-            `  bev=${payload.bev_image ?? "(none)"}` +
-            `  dashKeys=[${Object.keys(payload.dashboards ?? {}).join(", ")}]`
+            `[WS] 🖼️  New BEV render — revision=${imgRevisionRef.current}` +
+              `  bev=${payload.bev_image ?? "(none)"}` +
+              `  dashKeys=[${Object.keys(payload.dashboards ?? {}).join(", ")}]`,
           );
         }
       } catch {
@@ -359,9 +356,6 @@ function App() {
 
   // Fallback HTTP polling — always runs on mount to jump to the latest saved frame,
   // and keeps polling while live mode is on (as a safety net beside WS).
-  // When WS is connected we still poll but at a slower rate (1 s) solely to
-  // detect finished renders that the WS quick-payload missed.  We do NOT
-  // override frameIndex while WS is connected to avoid fighting the WS feed.
   const wsStatusRef = useRef<WsStatus>("reconnecting");
   wsStatusRef.current = wsStatus; // keep ref in sync without adding to deps
 
@@ -370,39 +364,41 @@ function App() {
 
     async function pollLatestManifest() {
       try {
-        const response = await fetch(`/live/latest.json?ts=${Date.now()}`);
+        const response = await fetch(`/live/latest.json?ts=${Date.now()}`, {
+          cache: "no-store",
+        });
         if (!response.ok) return;
-        const payload = (await response.json()) as LiveManifest;
+        const text = await response.text();
         if (cancelled) return;
+        if (!text.trim()) return;
+        let payload: LiveManifest;
+        try {
+          payload = JSON.parse(text) as LiveManifest;
+        } catch {
+          return;
+        }
         if (payload.frame_index > maxFrameRef.current) {
           maxFrameRef.current = payload.frame_index;
         }
-        // When WS is connected, only update the manifest for image refresh;
-        // do NOT reset frameIndex so we don't fight the WS stream.
-        if (wsStatusRef.current !== "connected") {
-          setFrameIndex(payload.frame_index);
-        }
+        // Always sync frameIndex from poll — if WS is slow/quiet the map
+        // would otherwise stay frozen on the initial frame.
+        setFrameIndex(payload.frame_index);
         setLiveManifest(payload);
-        // Bump image revision if a real render has landed.
-        const hasRealRender =
-          (payload.bev_image &&
-            payload.bev_image !== lastBevImageRef.current) ||
-          Object.keys(payload.dashboards ?? {}).length > 0 ||
-          Object.keys(payload.bev_by_observer ?? {}).length > 0;
+        // Only bump image revision when a finished render lands.
+        const hasRealRender = !!(
+          payload.render_complete === true &&
+          payload.bev_image &&
+          payload.bev_image !== lastBevImageRef.current
+        );
         if (hasRealRender) {
           lastBevImageRef.current = payload.bev_image ?? "";
           imgRevisionRef.current += 1;
           setImgRevision(imgRevisionRef.current);
           console.log(
-            `[POLL] 🖼️  Real render detected — revision=${imgRevisionRef.current}` +
-            `  frame=${payload.frame_index}` +
-            `  bev=${payload.bev_image ?? "(none)"}` +
-            `  dashKeys=[${Object.keys(payload.dashboards ?? {}).join(", ")}]`
-          );
-        } else {
-          console.log(
-            `[POLL] frame=${payload.frame_index} t=${payload.sim_time?.toFixed(2)}s — no new render` +
-            ` (wsStatus=${wsStatusRef.current})`
+            `[POLL] 🖼️  New BEV render — revision=${imgRevisionRef.current}` +
+              `  frame=${payload.frame_index}` +
+              `  bev=${payload.bev_image ?? "(none)"}` +
+              `  dashKeys=[${Object.keys(payload.dashboards ?? {}).join(", ")}]`,
           );
         }
       } catch {
@@ -429,6 +425,10 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
+    let retryTimer: number | null = null;
+    let attempt = 0;
+    const maxAttempts = 20;
+    const retryDelayMs = 1000;
 
     async function loadMap() {
       try {
@@ -444,9 +444,17 @@ function App() {
           throw new Error("Failed to parse SUMO map");
         }
         setSumoMap(parsed);
+        if (retryTimer !== null) {
+          window.clearTimeout(retryTimer);
+          retryTimer = null;
+        }
       } catch (err) {
         if (!cancelled) {
           setMapError((err as Error).message);
+          attempt += 1;
+          if (attempt <= maxAttempts) {
+            retryTimer = window.setTimeout(loadMap, retryDelayMs);
+          }
         }
       }
     }
@@ -454,6 +462,9 @@ function App() {
     loadMap();
     return () => {
       cancelled = true;
+      if (retryTimer !== null) {
+        window.clearTimeout(retryTimer);
+      }
     };
   }, []);
 
@@ -488,10 +499,10 @@ function App() {
 
         console.log(
           `[MAP] ✅ Frame ${json.step} loaded` +
-          `  t=${json.sim_time.toFixed(2)}s` +
-          `  vehicles=[${json.all_vehicles.map((v) => v.id).join(", ")}]` +
-          `  ego=${json.ego?.id ?? "(none)"}` +
-          `  coop=${json.coop?.id ?? "(none)"}`
+            `  t=${json.sim_time.toFixed(2)}s` +
+            `  vehicles=[${json.all_vehicles.map((v) => v.id).join(", ")}]` +
+            `  ego=${json.ego?.id ?? "(none)"}` +
+            `  coop=${json.coop?.id ?? "(none)"}`,
         );
 
         setFrameData(json);
@@ -510,7 +521,10 @@ function App() {
         });
       } catch (err) {
         if (!cancelled) {
-          console.warn(`[MAP] ❌ Failed to load frame ${frameIndex}:`, (err as Error).message);
+          console.warn(
+            `[MAP] ❌ Failed to load frame ${frameIndex}:`,
+            (err as Error).message,
+          );
           setError((err as Error).message);
           setFrameData(null);
         }
@@ -570,9 +584,9 @@ function App() {
     liveManifest?.bev_image ??
     `/fused/bev/frame_${frameIndex.toString().padStart(6, "0")}_bev.png`;
 
-  // imgRevision is our cache-buster: it only increments when a finished
-  // render payload (with real BEV/dashboard paths) has been received.
-  const liveRefreshKey = imgRevision;
+  // Prefer the manifest timestamp for cache-busting so dashboards refresh
+  // whenever a new live payload lands (quick or rendered).
+  const liveRefreshKey = liveManifest?.updated_at ?? imgRevision;
 
   const selectedStatus = observer
     ? (statusByVehicleId.get(observer.id) ?? "blind")
@@ -1079,12 +1093,12 @@ function App() {
                 className="max-h-64 w-full rounded-md border border-slate-700 object-contain"
                 onLoad={() =>
                   console.log(
-                    `[DASH] 🟢 Image loaded  frame=${frameIndex}  rev=${liveRefreshKey}  src=${observerDashboard}`
+                    `[DASH] 🟢 Image loaded  frame=${frameIndex}  rev=${liveRefreshKey}  src=${observerDashboard}`,
                   )
                 }
                 onError={() =>
                   console.warn(
-                    `[DASH] 🔴 Image error   frame=${frameIndex}  rev=${liveRefreshKey}  src=${observerDashboard}`
+                    `[DASH] 🔴 Image error   frame=${frameIndex}  rev=${liveRefreshKey}  src=${observerDashboard}`,
                   )
                 }
               />
@@ -1110,12 +1124,12 @@ function App() {
               className="max-h-64 w-full rounded-md border border-slate-700 object-contain"
               onLoad={() =>
                 console.log(
-                  `[BEV] 🟢 Image loaded  frame=${frameIndex}  rev=${liveRefreshKey}  src=${bevImage}`
+                  `[BEV] 🟢 Image loaded  frame=${frameIndex}  rev=${liveRefreshKey}  src=${bevImage}`,
                 )
               }
               onError={() =>
                 console.warn(
-                  `[BEV] 🔴 Image error   frame=${frameIndex}  rev=${liveRefreshKey}  src=${bevImage}`
+                  `[BEV] 🔴 Image error   frame=${frameIndex}  rev=${liveRefreshKey}  src=${bevImage}`,
                 )
               }
             />
